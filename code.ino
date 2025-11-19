@@ -1,98 +1,168 @@
-/* 
-hightech_security: Code for an Arduino-based, "high-tech" security system.
-The code runs on an Arduino Uno connected to an ultrasonic range sensor, LEDs and a buzzer.
-Passing through the security "beam" (ultrasonic range sensor) triggers an alarm!
-*/
+// Proximity-scaled alarm (HC-SR04 + LEDs + passive buzzer)
+// Pins: TRIG=D10, ECHO=D9, Green LED=D3, Red LED=D4, Buzzer=D11
 
-#define LEDGREENPIN 3
-#define LEDREDPIN 4
-#define BUZZERPIN 11
-#define TRIGGERPIN 10
-#define ECHOPIN 9
+#define TRIG 10
+#define ECHO 9
+#define LED_GREEN 3
+#define LED_RED   4
+#define BUZZER    11
 
-int alarm_activated = 0; // has the alarm been triggered yet?
-int door_width; // the normal distance that the guarding "beam" covers
+// -------- Tuning --------
+// The alarm starts ramping when distance <= FAR_MM, and gets frantic near NEAR_MM.
+const int FAR_MM   = 1500;  // start giving sparse beeps inside this distance
+const int NEAR_MM  = 150;   // very close (fastest pattern)
 
-// Function used to measure distance using ultrasonic range sensor
-int measure_distance_ultrasonic() {
+// Pattern timing (computed each loop from distance):
+const int MAX_PERIOD_MS = 1600;  // was 900 — much slower when far
+const int MIN_PERIOD_MS = 110;   // was 120 — a touch faster when near
+const float ON_FRACTION = 0.30;  // slightly shorter ON at distance
 
-  // Send an output pulse to the sonar sensor (1ms wide)
-  digitalWrite(TRIGGERPIN, HIGH);
-  delay(1); // wait 1ms
-  digitalWrite(TRIGGERPIN, LOW);
+// Pitch (you chose these — nice!)
+const int TONE_MIN_HZ = 400;
+const int TONE_MAX_HZ = 1600;
 
-  // Measure the time taken to receive the pulse back // Will be "0" or "-1" if no pulse is received
-  int duration = pulseIn(ECHOPIN, HIGH);
+const unsigned long TIMEOUT_US = 38000UL; // pulseIn timeout (~6.5 m)
 
-  // Formula for the distance is half the duration, then divide by 2.910
-  // to get distance in mm
-  int distance = (duration/2) / 2.91;
-  return distance;
+// Simple smoothing: median of last 3 readings to reduce jitter
+int last3[3] = {-1, -1, -1};
+int idx = 0;
 
-}
+// Pattern state
+unsigned long phaseStartMs = 0;
+bool phaseOn = false;
 
-// Function to activate the alarm!
-void sound_alarm() {
-  digitalWrite(BUZZERPIN, HIGH);
-  digitalWrite(LEDREDPIN, HIGH);
-  delay(500);
-  digitalWrite(BUZZERPIN, LOW);
-  digitalWrite(LEDREDPIN, LOW);
-  delay(500);
-  digitalWrite(BUZZERPIN, HIGH);
-  digitalWrite(LEDREDPIN, HIGH);
-  delay(500);
-  digitalWrite(BUZZERPIN, LOW);
-  digitalWrite(LEDREDPIN, LOW);
-  delay(500);
-  digitalWrite(BUZZERPIN, HIGH);
-  digitalWrite(LEDREDPIN, HIGH);
-  delay(500);
-  digitalWrite(BUZZERPIN, LOW);
-}
+// --- Helpers ---
+int readDistanceMm();
+int median3(int a, int b, int c);
+int mapLinear(int x, int in_min, int in_max, int out_min, int out_max);
 
-// This function is called once at the start of the program
 void setup() {
   Serial.begin(115200);
+  pinMode(TRIG, OUTPUT);  pinMode(ECHO, INPUT);
+  pinMode(LED_GREEN, OUTPUT); pinMode(LED_RED, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
 
-  pinMode(LEDGREENPIN, OUTPUT); // Green LED can be switched on/off from this pin
-  pinMode(LEDREDPIN, OUTPUT); // Red LED can be switched on/off from this pin
-  pinMode(BUZZERPIN, OUTPUT); // Active Buzzer can be switched on/off from this pin
-  digitalWrite(BUZZERPIN, LOW); // Turn it off to begin with!
+  digitalWrite(TRIG, LOW);
+  digitalWrite(LED_GREEN, LOW);
+  digitalWrite(LED_RED, LOW);
+  noTone(BUZZER);
 
-  pinMode(TRIGGERPIN, OUTPUT); // Sonar pulses will be sent out of the Arduino
-  pinMode(ECHOPIN, INPUT); // Echo pulses will be received into the Arduino
-
-  delay(50);
-  door_width = measure_distance_ultrasonic(); // measure initial doorway width
-
-  Serial.print("door width (mm):\n"); 
-  Serial.print(door_width);
-  Serial.print("\n"); 
-
-  pinMode(13, OUTPUT); // switch off on-board LED for now
-  digitalWrite(13, LOW);
-  
-  delay(50); // let the sensor stabilise
+  // Prime smoothing buffer with a valid reading if possible
+  delay(100);
 }
 
-// This function is called repeatedly by the program
 void loop() {
+  // ---- 1) Read and smooth distance (mm) ----
+  int mm = readDistanceMm();
+  last3[idx] = mm; idx = (idx + 1) % 3;
+  int smoothed = median3(last3[0], last3[1], last3[2]);
 
-  if (alarm_activated == 0) { // not actived yet
-    digitalWrite(LEDGREENPIN, HIGH); // green light on
-    digitalWrite(LEDREDPIN, LOW); // red light off
+  // ---- 2) Decide if we’re in alarm range ----
+  bool valid = (smoothed >= 0);
+  bool inRange = valid && (smoothed <= FAR_MM);
 
-    int distance = measure_distance_ultrasonic(); // measure current doorway
+  // ---- 3) Compute pattern parameters from proximity (linear ramp) ----
+  int periodMs = MAX_PERIOD_MS;
+  int toneHz   = TONE_MIN_HZ;
 
-    if (distance < 0.8*door_width) { // something is passing the door! (0.8 to avoid false alarms)
-      digitalWrite(LEDGREENPIN, LOW);
-      sound_alarm(); // Sound the alarm!
-      alarm_activated = 1; // we only want to sound the alarm once, so let's switch off future checks
-    }
+  if (inRange) {
+    // p = 0 at FAR_MM … 1 at NEAR_MM
+    float p = (float)(FAR_MM - smoothed) / (float)(FAR_MM - NEAR_MM);
+    if (p < 0) p = 0; if (p > 1) p = 1;
 
+    // Non-linear (cubic) easing: slow changes when far, rapid ramp when close
+    float e = p * p * p;  // try p^3 (you can try p^2 for milder, p^4 for stronger)
+
+    periodMs = (int)(MAX_PERIOD_MS - e * (MAX_PERIOD_MS - MIN_PERIOD_MS) + 0.5f);
+    toneHz   = (int)(TONE_MIN_HZ  + e * (TONE_MAX_HZ  - TONE_MIN_HZ ) + 0.5f);
   }
 
-  delay(50); 
+  // ---- 4) Drive outputs (non-blocking) ----
+  if (!inRange) {
+    // Clear state
+    phaseOn = false; phaseStartMs = 0;
+    digitalWrite(LED_RED, LOW);
+    noTone(BUZZER);
+    digitalWrite(LED_GREEN, HIGH);      // ready/clear
+  } else {
+    digitalWrite(LED_GREEN, LOW);       // we're alarming now
 
+    unsigned long now = millis();
+    if (phaseStartMs == 0) {            // start a new cycle
+      phaseStartMs = now;
+      phaseOn = true;
+      digitalWrite(LED_RED, HIGH);
+      tone(BUZZER, toneHz);
+    }
+
+    // How long is the ON part this cycle?
+    unsigned long onMs  = (unsigned long)(periodMs * ON_FRACTION);
+    unsigned long offMs = (unsigned long)(periodMs - onMs);
+
+    if (phaseOn) {
+      if (now - phaseStartMs >= onMs) {
+        // switch to OFF
+        phaseOn = false;
+        phaseStartMs = now;
+        digitalWrite(LED_RED, LOW);
+        noTone(BUZZER);
+      }
+    } else {
+      if (now - phaseStartMs >= offMs) {
+        // switch back to ON (new cycle)
+        phaseOn = true;
+        phaseStartMs = now;
+        digitalWrite(LED_RED, HIGH);
+        tone(BUZZER, toneHz);
+      }
+    }
+  }
+
+  // ---- 5) Serial for tuning ----
+  Serial.print("mm=");
+  Serial.print(smoothed);
+  Serial.print("  inRange=");
+  Serial.print(inRange ? 1 : 0);
+  Serial.print("  periodMs=");
+  Serial.print(periodMs);
+  Serial.print("  toneHz=");
+  Serial.println(toneHz);
+
+  delay(30); // readable stream without affecting responsiveness
+}
+
+// ------------ Distance helpers ------------
+int readDistanceMm() {
+  // 10 µs trigger pulse
+  digitalWrite(TRIG, LOW); delayMicroseconds(2);
+  digitalWrite(TRIG, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG, LOW);
+
+  unsigned long us = pulseIn(ECHO, HIGH, TIMEOUT_US);
+  if (us == 0) return -1;  // no echo
+
+  // mm = (us * 0.343) / 2
+  float mm = (us * 0.343f) * 0.5f;
+  if (mm < 0 || mm > 6000) return -1;
+  return (int)(mm + 0.5f);
+}
+
+int median3(int a, int b, int c) {
+  // handle invalids (-1): prefer any valid values
+  int v[3] = {a, b, c};
+  int validCount = 0;
+  int buf[3];
+  for (int i = 0; i < 3; ++i) {
+    if (v[i] >= 0) buf[validCount++] = v[i];
+  }
+  if (validCount == 0) return -1;
+  if (validCount == 1) return buf[0];
+  if (validCount == 2) {
+    return (buf[0] + buf[1]) / 2;
+  }
+  // 3 valid: sort small array
+  if (buf[0] > buf[1]) { int t = buf[0]; buf[0] = buf[1]; buf[1] = t; }
+  if (buf[1] > buf[2]) { int t = buf[1]; buf[1] = buf[2]; buf[2] = t; }
+  if (buf[0] > buf[1]) { int t = buf[0]; buf[0] = buf[1]; buf[1] = t; }
+  return buf[1]; // median
 }
