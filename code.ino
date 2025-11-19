@@ -1,168 +1,261 @@
-// Proximity-scaled alarm (HC-SR04 + LEDs + passive buzzer)
-// Pins: TRIG=D10, ECHO=D9, Green LED=D3, Red LED=D4, Buzzer=D11
+/*
+  High-Tech Security System — Proximity-Scaled Alarm (HC-SR04 + LEDs + Buzzer)
+  ---------------------------------------------------------------------------
+  What this does:
+    - Measures distance with an HC-SR04 (TRIG D10, ECHO D9)
+    - Decides if someone is within the "attention zone" (≤ FAR distance)
+    - Communicates by beeping/blinking: slower when far, faster/more urgent when near
+    - Camera-free, privacy-friendly; matches the slides' "Sense → Decide → Communicate"
 
-#define TRIG 10
-#define ECHO 9
-#define LED_GREEN 3
-#define LED_RED   4
-#define BUZZER    11
+  How to tune (edit ONLY the TUNABLES section below):
+    - FAR_DISTANCE_MM: where sparse beeps begin
+    - NEAR_DISTANCE_MM: where the pattern is most urgent
+    - MAX/MIN_PERIOD_MS: slowest vs fastest beep cycle length
+    - ON_FRACTION: how much of each cycle is ON (LED/buzzer)
+    - TONE_MIN/MAX_HZ: pitch range as proximity increases
 
-// -------- Tuning --------
-// The alarm starts ramping when distance <= FAR_MM, and gets frantic near NEAR_MM.
-const int FAR_MM   = 1500;  // start giving sparse beeps inside this distance
-const int NEAR_MM  = 150;   // very close (fastest pattern)
+  Hardware (unchanged):
+    - TRIG=D10, ECHO=D9, GREEN LED=D3 (ready), RED LED=D4 (alarm), BUZZER=D11
+    - LEDs use 470 Ω resistors to GND (anode on the pin via resistor, cathode to GND)
+*/
 
-// Pattern timing (computed each loop from distance):
-const int MAX_PERIOD_MS = 1600;  // was 900 — much slower when far
-const int MIN_PERIOD_MS = 110;   // was 120 — a touch faster when near
-const float ON_FRACTION = 0.30;  // slightly shorter ON at distance
+#include <Arduino.h>
 
-// Pitch (you chose these — nice!)
-const int TONE_MIN_HZ = 400;
-const int TONE_MAX_HZ = 1600;
+// ------------------------------
+// Pin mapping (hardware wiring)
+// ------------------------------
+const uint8_t PIN_TRIG      = 10;
+const uint8_t PIN_ECHO      = 9;
+const uint8_t PIN_LED_GREEN = 3;   // "ready/clear" indicator
+const uint8_t PIN_LED_RED   = 4;   // "alarming" indicator
+const uint8_t PIN_BUZZER    = 11;  // passive buzzer (tone capable)
 
+// Sensor reading
 const unsigned long TIMEOUT_US = 38000UL; // pulseIn timeout (~6.5 m)
 
-// Simple smoothing: median of last 3 readings to reduce jitter
-int last3[3] = {-1, -1, -1};
-int idx = 0;
+// ------------------------------
+// TUNABLES — CHANGE ME!
+// ------------------------------
+// Alarm begins ramping when distance <= FAR; becomes urgent near NEAR.
+const int FAR_DISTANCE_MM   = ?;   // start sparse beeps inside this distance
+const int NEAR_DISTANCE_MM  = ?;    // very close (fastest pattern)
 
-// Pattern state
-unsigned long phaseStartMs = 0;
-bool phaseOn = false;
+// Pattern timing (derived each loop from distance)
+const int   MAX_PERIOD_MS   = ?;   // slow beeps when far
+const int   MIN_PERIOD_MS   = ?;    // fast beeps when near
+const float ON_FRACTION     = 0.30f;  // portion of each cycle that is ON (LED/buzzer)
 
-// --- Helpers ---
-int readDistanceMm();
-int median3(int a, int b, int c);
-int mapLinear(int x, int in_min, int in_max, int out_min, int out_max);
+// Pitch ramp (optional: proximity → higher pitch)
+const int TONE_MIN_HZ       = ?;
+const int TONE_MAX_HZ       = ?;
 
+// ------------------------------------------------------------------------------------------------------------------------
+// Internal state (do not edit)
+// ------------------------------------------------------------------------------------------------------------------------
+
+// Simple smoothing buffer: median of last 3 distances (in mm, -1 = invalid)
+static int      distanceBuf[3] = { -1, -1, -1 };
+static uint8_t  distanceIdx    = 0;
+
+// Pattern phase state (non-blocking blinks/beeps)
+struct PatternState {
+  unsigned long phaseStartMs = 0; // start time of current ON or OFF phase
+  bool          phaseOn      = false; // true=ON (LED/tone), false=OFF (quiet)
+};
+static PatternState pattern;
+
+// ------------------------------
+// Forward declarations
+// ------------------------------
+int  readDistanceMmOnce();
+int  readAndSmoothDistanceMm();
+int  medianOf3_allowInvalid(int a, int b, int c);
+
+struct PatternParams {
+  int periodMs;           // full cycle length
+  int toneHz;             // tone frequency for current proximity
+  unsigned long onMs;     // ON duration in this cycle
+  unsigned long offMs;    // OFF duration in this cycle
+};
+PatternParams computePatternFromDistance(int smoothedMm, bool inRange);
+void driveOutputs(bool inRange, const PatternParams& p, PatternState& s);
+void logStatus(int smoothedMm, bool inRange, const PatternParams& p);
+
+// ------------------------------
+// Setup
+// ------------------------------
 void setup() {
   Serial.begin(115200);
-  pinMode(TRIG, OUTPUT);  pinMode(ECHO, INPUT);
-  pinMode(LED_GREEN, OUTPUT); pinMode(LED_RED, OUTPUT);
-  pinMode(BUZZER, OUTPUT);
 
-  digitalWrite(TRIG, LOW);
-  digitalWrite(LED_GREEN, LOW);
-  digitalWrite(LED_RED, LOW);
-  noTone(BUZZER);
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  pinMode(PIN_LED_GREEN, OUTPUT);
+  pinMode(PIN_LED_RED, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
 
-  // Prime smoothing buffer with a valid reading if possible
-  delay(100);
+  // Known safe outputs on boot
+  digitalWrite(PIN_TRIG, LOW);
+  digitalWrite(PIN_LED_GREEN, LOW);
+  digitalWrite(PIN_LED_RED, LOW);
+  noTone(PIN_BUZZER);
+
+  delay(100); // sensor settle
 }
 
+// ------------------------------
+// Main loop (reads like pseudocode)
+// ------------------------------
 void loop() {
-  // ---- 1) Read and smooth distance (mm) ----
-  int mm = readDistanceMm();
-  last3[idx] = mm; idx = (idx + 1) % 3;
-  int smoothed = median3(last3[0], last3[1], last3[2]);
+  // 1) Sense: read and smooth distance (mm), -1 if invalid/out of range
+  const int smoothedMm = readAndSmoothDistanceMm();
 
-  // ---- 2) Decide if we’re in alarm range ----
-  bool valid = (smoothed >= 0);
-  bool inRange = valid && (smoothed <= FAR_MM);
+  // 2) Decide: are we inside the attention zone?
+  const bool valid   = (smoothedMm >= 0);
+  const bool inRange = valid && (smoothedMm <= FAR_DISTANCE_MM);
 
-  // ---- 3) Compute pattern parameters from proximity (linear ramp) ----
-  int periodMs = MAX_PERIOD_MS;
-  int toneHz   = TONE_MIN_HZ;
+  // 3) Map proximity → pattern parameters (period & tone), using cubic easing
+  const PatternParams params = computePatternFromDistance(smoothedMm, inRange);
+
+  // 4) Communicate: drive LEDs + buzzer with a non-blocking state machine
+  driveOutputs(inRange, params, pattern);
+
+  // 5) Observe: print status for tuning
+  logStatus(smoothedMm, inRange, params);
+
+  // Human-readable update rate without affecting responsiveness
+  delay(30);
+}
+
+// ======================================================================
+// Implementation
+// ======================================================================
+
+// Trigger one HC-SR04 measurement; return distance in mm, or -1 if invalid
+int readDistanceMmOnce() {
+  // Spec: 10 µs trigger pulse
+  digitalWrite(PIN_TRIG, LOW); delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH); delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+
+  // Echo HIGH width in microseconds (timeout prevents hanging)
+  const unsigned long us = pulseIn(PIN_ECHO, HIGH, TIMEOUT_US);
+  if (us == 0) return -1; // no echo (too far, bad aim, soft/angled target)
+
+  // Distance (mm) = (us * speed_of_sound_mm_per_us) / 2
+  // Speed of sound ≈ 0.343 mm/µs at room temp; divide by 2 for out-and-back
+  const float mm = (us * 0.343f) * 0.5f;
+
+  if (mm < 0.0f || mm > 6000.0f) return -1; // sanity clamp
+  return (int)(mm + 0.5f);                  // round to nearest mm
+}
+
+// Update 3-sample buffer and return median (ignores invalids when possible)
+int readAndSmoothDistanceMm() {
+  const int mm = readDistanceMmOnce();
+  distanceBuf[distanceIdx] = mm;
+  distanceIdx = (uint8_t)((distanceIdx + 1) % 3);
+  return medianOf3_allowInvalid(distanceBuf[0], distanceBuf[1], distanceBuf[2]);
+}
+
+// Median of 3 that tolerates -1 (invalid). If all invalid → -1.
+int medianOf3_allowInvalid(int a, int b, int c) {
+  int tmp[3];
+  int n = 0;
+  if (a >= 0) tmp[n++] = a;
+  if (b >= 0) tmp[n++] = b;
+  if (c >= 0) tmp[n++] = c;
+
+  if (n == 0) return -1;
+  if (n == 1) return tmp[0];
+  if (n == 2) return (tmp[0] + tmp[1]) / 2;
+
+  // n == 3: sort small array
+  if (tmp[0] > tmp[1]) { int t = tmp[0]; tmp[0] = tmp[1]; tmp[1] = t; }
+  if (tmp[1] > tmp[2]) { int t = tmp[1]; tmp[1] = tmp[2]; tmp[2] = t; }
+  if (tmp[0] > tmp[1]) { int t = tmp[0]; tmp[0] = tmp[1]; tmp[1] = t; }
+  return tmp[1];
+}
+
+// Convert proximity → pattern parameters (period & tone), using cubic easing
+PatternParams computePatternFromDistance(int smoothedMm, bool inRange) {
+  PatternParams p;
+  // Defaults when out of range (we won't use tone/period, but keep consistent)
+  p.periodMs = MAX_PERIOD_MS;
+  p.toneHz   = TONE_MIN_HZ;
 
   if (inRange) {
-    // p = 0 at FAR_MM … 1 at NEAR_MM
-    float p = (float)(FAR_MM - smoothed) / (float)(FAR_MM - NEAR_MM);
-    if (p < 0) p = 0; if (p > 1) p = 1;
+    // p = 0 at FAR … 1 at NEAR
+    float norm = (float)(FAR_DISTANCE_MM - smoothedMm) /
+                 (float)(FAR_DISTANCE_MM - NEAR_DISTANCE_MM);
+    if (norm < 0.0f) norm = 0.0f;
+    if (norm > 1.0f) norm = 1.0f;
 
-    // Non-linear (cubic) easing: slow changes when far, rapid ramp when close
-    float e = p * p * p;  // try p^3 (you can try p^2 for milder, p^4 for stronger)
+    // Cubic easing: slow change when far, rapid ramp when close
+    const float ease = norm * norm * norm; // p^3
 
-    periodMs = (int)(MAX_PERIOD_MS - e * (MAX_PERIOD_MS - MIN_PERIOD_MS) + 0.5f);
-    toneHz   = (int)(TONE_MIN_HZ  + e * (TONE_MAX_HZ  - TONE_MIN_HZ ) + 0.5f);
+    p.periodMs = (int)(MAX_PERIOD_MS - ease * (MAX_PERIOD_MS - MIN_PERIOD_MS) + 0.5f);
+    p.toneHz   = (int)(TONE_MIN_HZ  + ease * (TONE_MAX_HZ  - TONE_MIN_HZ ) + 0.5f);
   }
 
-  // ---- 4) Drive outputs (non-blocking) ----
+  // ON/OFF split for this cycle
+  p.onMs  = (unsigned long)(p.periodMs * ON_FRACTION);
+  p.offMs = (unsigned long)(p.periodMs - p.onMs);
+  return p;
+}
+
+// Drive LEDs + buzzer based on proximity pattern (non-blocking state machine)
+void driveOutputs(bool inRange, const PatternParams& p, PatternState& s) {
   if (!inRange) {
-    // Clear state
-    phaseOn = false; phaseStartMs = 0;
-    digitalWrite(LED_RED, LOW);
-    noTone(BUZZER);
-    digitalWrite(LED_GREEN, HIGH);      // ready/clear
-  } else {
-    digitalWrite(LED_GREEN, LOW);       // we're alarming now
-
-    unsigned long now = millis();
-    if (phaseStartMs == 0) {            // start a new cycle
-      phaseStartMs = now;
-      phaseOn = true;
-      digitalWrite(LED_RED, HIGH);
-      tone(BUZZER, toneHz);
-    }
-
-    // How long is the ON part this cycle?
-    unsigned long onMs  = (unsigned long)(periodMs * ON_FRACTION);
-    unsigned long offMs = (unsigned long)(periodMs - onMs);
-
-    if (phaseOn) {
-      if (now - phaseStartMs >= onMs) {
-        // switch to OFF
-        phaseOn = false;
-        phaseStartMs = now;
-        digitalWrite(LED_RED, LOW);
-        noTone(BUZZER);
-      }
-    } else {
-      if (now - phaseStartMs >= offMs) {
-        // switch back to ON (new cycle)
-        phaseOn = true;
-        phaseStartMs = now;
-        digitalWrite(LED_RED, HIGH);
-        tone(BUZZER, toneHz);
-      }
-    }
+    // Clear state and show "ready"
+    s.phaseOn = false;
+    s.phaseStartMs = 0;
+    digitalWrite(PIN_LED_RED, LOW);
+    noTone(PIN_BUZZER);
+    digitalWrite(PIN_LED_GREEN, HIGH);
+    return;
   }
 
-  // ---- 5) Serial for tuning ----
+  // In alarm range: green off, run blink/beep pattern on red + buzzer
+  digitalWrite(PIN_LED_GREEN, LOW);
+
+  const unsigned long now = millis();
+
+  // Start a new cycle if needed
+  if (s.phaseStartMs == 0) {
+    s.phaseStartMs = now;
+    s.phaseOn = true;
+    digitalWrite(PIN_LED_RED, HIGH);
+    tone(PIN_BUZZER, p.toneHz);
+    return;
+  }
+
+  if (s.phaseOn) {
+    if (now - s.phaseStartMs >= p.onMs) {
+      // Switch to OFF phase
+      s.phaseOn = false;
+      s.phaseStartMs = now;
+      digitalWrite(PIN_LED_RED, LOW);
+      noTone(PIN_BUZZER);
+    }
+  } else {
+    if (now - s.phaseStartMs >= p.offMs) {
+      // Switch back to ON phase (new cycle)
+      s.phaseOn = true;
+      s.phaseStartMs = now;
+      digitalWrite(PIN_LED_RED, HIGH);
+      tone(PIN_BUZZER, p.toneHz);
+    }
+  }
+}
+
+// Serial logging for tuning (kept identical keys/format)
+void logStatus(int smoothedMm, bool inRange, const PatternParams& p) {
   Serial.print("mm=");
-  Serial.print(smoothed);
+  Serial.print(smoothedMm);
   Serial.print("  inRange=");
   Serial.print(inRange ? 1 : 0);
   Serial.print("  periodMs=");
-  Serial.print(periodMs);
+  Serial.print(p.periodMs);
   Serial.print("  toneHz=");
-  Serial.println(toneHz);
-
-  delay(30); // readable stream without affecting responsiveness
-}
-
-// ------------ Distance helpers ------------
-int readDistanceMm() {
-  // 10 µs trigger pulse
-  digitalWrite(TRIG, LOW); delayMicroseconds(2);
-  digitalWrite(TRIG, HIGH); delayMicroseconds(10);
-  digitalWrite(TRIG, LOW);
-
-  unsigned long us = pulseIn(ECHO, HIGH, TIMEOUT_US);
-  if (us == 0) return -1;  // no echo
-
-  // mm = (us * 0.343) / 2
-  float mm = (us * 0.343f) * 0.5f;
-  if (mm < 0 || mm > 6000) return -1;
-  return (int)(mm + 0.5f);
-}
-
-int median3(int a, int b, int c) {
-  // handle invalids (-1): prefer any valid values
-  int v[3] = {a, b, c};
-  int validCount = 0;
-  int buf[3];
-  for (int i = 0; i < 3; ++i) {
-    if (v[i] >= 0) buf[validCount++] = v[i];
-  }
-  if (validCount == 0) return -1;
-  if (validCount == 1) return buf[0];
-  if (validCount == 2) {
-    return (buf[0] + buf[1]) / 2;
-  }
-  // 3 valid: sort small array
-  if (buf[0] > buf[1]) { int t = buf[0]; buf[0] = buf[1]; buf[1] = t; }
-  if (buf[1] > buf[2]) { int t = buf[1]; buf[1] = buf[2]; buf[2] = t; }
-  if (buf[0] > buf[1]) { int t = buf[0]; buf[0] = buf[1]; buf[1] = t; }
-  return buf[1]; // median
+  Serial.println(p.toneHz);
 }
