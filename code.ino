@@ -13,6 +13,7 @@
     - MAX/MIN_PERIOD_MS: slowest vs fastest beep cycle length
     - ON_FRACTION: how much of each cycle is ON (LED/buzzer)
     - TONE_MIN/MAX_HZ: pitch range as proximity increases
+    - RAMP_SHAPE: how the urgency ramps with proximity (LINEAR, QUADRATIC, CUBIC, QUARTIC, SMOOTHSTEP)
 
   Hardware (unchanged):
     - TRIG=D10, ECHO=D9, GREEN LED=D3 (ready), RED LED=D4 (alarm), BUZZER=D11
@@ -34,20 +35,35 @@ const uint8_t PIN_BUZZER    = 11;  // passive buzzer (tone capable)
 const unsigned long TIMEOUT_US = 38000UL; // pulseIn timeout (~6.5 m)
 
 // ------------------------------
+// Ramp shape options (students pick one in TUNABLES)
+// ------------------------------
+enum RampShape : uint8_t {
+  RAMP_LINEAR,      // e = p               (even ramp)
+  RAMP_QUADRATIC,   // e = p^2             (gentler far, steeper near)
+  RAMP_CUBIC,       // e = p^3             (your current default)
+  RAMP_QUARTIC,     // e = p^4             (very gentle far, very steep near)
+  RAMP_SMOOTHSTEP   // e = p^2*(3 - 2p)    (S-curve; soft start & finish)
+};
+
+// ------------------------------
 // TUNABLES — CHANGE ME!
 // ------------------------------
 // Alarm begins ramping when distance <= FAR; becomes urgent near NEAR.
-const int FAR_DISTANCE_MM   = ?;   // start sparse beeps inside this distance
-const int NEAR_DISTANCE_MM  = ?;    // very close (fastest pattern)
+const int   FAR_DISTANCE_MM   = ?;   // start sparse beeps inside this distance
+const int   NEAR_DISTANCE_MM  = ?;    // very close (fastest pattern)
 
 // Pattern timing (derived each loop from distance)
-const int   MAX_PERIOD_MS   = ?;   // slow beeps when far
-const int   MIN_PERIOD_MS   = ?;    // fast beeps when near
-const float ON_FRACTION     = 0.30f;  // portion of each cycle that is ON (LED/buzzer)
+const int   MAX_PERIOD_MS     = ?;   // slow beeps when far
+const int   MIN_PERIOD_MS     = ?;    // fast beeps when near
+const float ON_FRACTION       = 0.30f;  // portion of each cycle that is ON (LED/buzzer)
 
 // Pitch ramp (optional: proximity → higher pitch)
-const int TONE_MIN_HZ       = ?;
-const int TONE_MAX_HZ       = ?;
+const int   TONE_MIN_HZ       = ?;
+const int   TONE_MAX_HZ       = ?;
+
+// Choose the proximity→urgency curve (default keeps your exact behavior)
+const RampShape RAMP_SHAPE    = ?;
+// Choose from : RAMP_LINEAR , RAMP_QUADRATIC , RAMP_CUBIC , RAMP_QUARTIC , RAMP_SMOOTHSTEP
 
 // ------------------------------------------------------------------------------------------------------------------------
 // Internal state (do not edit)
@@ -77,6 +93,7 @@ struct PatternParams {
   unsigned long onMs;     // ON duration in this cycle
   unsigned long offMs;    // OFF duration in this cycle
 };
+float applyRamp(float p, RampShape shape);
 PatternParams computePatternFromDistance(int smoothedMm, bool inRange);
 void driveOutputs(bool inRange, const PatternParams& p, PatternState& s);
 void logStatus(int smoothedMm, bool inRange, const PatternParams& p);
@@ -113,7 +130,7 @@ void loop() {
   const bool valid   = (smoothedMm >= 0);
   const bool inRange = valid && (smoothedMm <= FAR_DISTANCE_MM);
 
-  // 3) Map proximity → pattern parameters (period & tone), using cubic easing
+  // 3) Map proximity → pattern parameters (period & tone), using selected ramp shape
   const PatternParams params = computePatternFromDistance(smoothedMm, inRange);
 
   // 4) Communicate: drive LEDs + buzzer with a non-blocking state machine
@@ -176,31 +193,46 @@ int medianOf3_allowInvalid(int a, int b, int c) {
   return tmp[1];
 }
 
-// Convert proximity → pattern parameters (period & tone), using cubic easing
+// Map 0..1 proximity -> eased 0..1 according to selected ramp shape
+float applyRamp(float p, RampShape shape) {
+  if (p <= 0.0f) return 0.0f;
+  if (p >= 1.0f) return 1.0f;
+
+  switch (shape) {
+    case RAMP_LINEAR:     return p;
+    case RAMP_QUADRATIC:  return p * p;
+    case RAMP_CUBIC:      return p * p * p;                    // current default
+    case RAMP_QUARTIC:    return p * p * p * p;
+    case RAMP_SMOOTHSTEP: return p * p * (3.0f - 2.0f * p);    // S-curve
+    default:              return p;
+  }
+}
+
+// Convert proximity → pattern parameters (period & tone) using the chosen ramp
 PatternParams computePatternFromDistance(int smoothedMm, bool inRange) {
-  PatternParams p;
+  PatternParams pOut;
   // Defaults when out of range (we won't use tone/period, but keep consistent)
-  p.periodMs = MAX_PERIOD_MS;
-  p.toneHz   = TONE_MIN_HZ;
+  pOut.periodMs = MAX_PERIOD_MS;
+  pOut.toneHz   = TONE_MIN_HZ;
 
   if (inRange) {
-    // p = 0 at FAR … 1 at NEAR
+    // Normalize proximity: p = 0 at FAR … 1 at NEAR
     float norm = (float)(FAR_DISTANCE_MM - smoothedMm) /
                  (float)(FAR_DISTANCE_MM - NEAR_DISTANCE_MM);
     if (norm < 0.0f) norm = 0.0f;
     if (norm > 1.0f) norm = 1.0f;
 
-    // Cubic easing: slow change when far, rapid ramp when close
-    const float ease = norm * norm * norm; // p^3
+    // Apply selected ramp shaping
+    const float ease = applyRamp(norm, RAMP_SHAPE);
 
-    p.periodMs = (int)(MAX_PERIOD_MS - ease * (MAX_PERIOD_MS - MIN_PERIOD_MS) + 0.5f);
-    p.toneHz   = (int)(TONE_MIN_HZ  + ease * (TONE_MAX_HZ  - TONE_MIN_HZ ) + 0.5f);
+    pOut.periodMs = (int)(MAX_PERIOD_MS - ease * (MAX_PERIOD_MS - MIN_PERIOD_MS) + 0.5f);
+    pOut.toneHz   = (int)(TONE_MIN_HZ  + ease * (TONE_MAX_HZ  - TONE_MIN_HZ ) + 0.5f);
   }
 
   // ON/OFF split for this cycle
-  p.onMs  = (unsigned long)(p.periodMs * ON_FRACTION);
-  p.offMs = (unsigned long)(p.periodMs - p.onMs);
-  return p;
+  pOut.onMs  = (unsigned long)(pOut.periodMs * ON_FRACTION);
+  pOut.offMs = (unsigned long)(pOut.periodMs - pOut.onMs);
+  return pOut;
 }
 
 // Drive LEDs + buzzer based on proximity pattern (non-blocking state machine)
